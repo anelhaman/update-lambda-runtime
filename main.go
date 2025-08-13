@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	lamtypes "github.com/aws/aws-sdk-go-v2/service/lambda/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/spf13/cobra"
 )
 
@@ -23,6 +24,8 @@ type AWSOpts struct {
 	TargetRuntime string
 	Timeout       time.Duration
 	PollEvery     time.Duration
+	ShowProfile   bool // default false; output focuses on AccountID
+
 }
 
 func main() {
@@ -31,10 +34,11 @@ func main() {
 		TargetRuntime: "python3.12",
 		Timeout:       5 * time.Minute,
 		PollEvery:     5 * time.Second,
+		ShowProfile:   false,
 	}
 
 	rootCmd := &cobra.Command{
-		Use:   "lambda-tool",
+		Use:   "update-lambda-runtime",
 		Short: "Manage AWS Lambda runtimes across accounts/regions",
 	}
 
@@ -46,6 +50,7 @@ func main() {
 	rootCmd.PersistentFlags().StringVar(&opts.TargetRuntime, "target-runtime", opts.TargetRuntime, "Update to this runtime")
 	rootCmd.PersistentFlags().DurationVar(&opts.Timeout, "wait-timeout", opts.Timeout, "Max time to wait for update")
 	rootCmd.PersistentFlags().DurationVar(&opts.PollEvery, "wait-interval", opts.PollEvery, "Polling interval during update")
+	rootCmd.PersistentFlags().BoolVar(&opts.ShowProfile, "show-profile", opts.ShowProfile, "Also print profile column")
 
 	listCmd := &cobra.Command{
 		Use:   "list",
@@ -71,12 +76,19 @@ func main() {
 	}
 }
 
+// --- core flows ---
 func runList(opts *AWSOpts) error {
 	if err := validateCommon(opts); err != nil {
 		return err
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-	printHeader(tw)
+	printHeader(tw, opts.ShowProfile)
+
+	acctID, err := resolveAccountID(opts.Profile)
+	if err != nil {
+		return fmt.Errorf("resolve account id: %w", err)
+	}
+
 	for _, region := range opts.Regions {
 		cli, err := lambdaClient(region, opts.Profile)
 		if err != nil {
@@ -84,11 +96,11 @@ func runList(opts *AWSOpts) error {
 		}
 		if opts.FunctionName != "" {
 			rt, _ := getRuntime(cli, opts.FunctionName)
-			printRow(tw, opts.Profile, region, opts.FunctionName, rt)
+			printRow(tw, acctID, opts.Profile, region, opts.FunctionName, rt, opts.ShowProfile)
 		} else {
 			funcs, _ := listAllFunctions(cli)
 			for _, f := range funcs {
-				printRow(tw, opts.Profile, region, aws.ToString(f.FunctionName), string(f.Runtime))
+				printRow(tw, acctID, opts.Profile, region, aws.ToString(f.FunctionName), string(f.Runtime), opts.ShowProfile)
 			}
 		}
 	}
@@ -101,7 +113,12 @@ func runBump(opts *AWSOpts) error {
 		return err
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-	printHeader(tw)
+	printHeader(tw, opts.ShowProfile)
+
+	acctID, err := resolveAccountID(opts.Profile)
+	if err != nil {
+		return fmt.Errorf("resolve account id: %w", err)
+	}
 
 	for _, region := range opts.Regions {
 		cli, err := lambdaClient(region, opts.Profile)
@@ -110,7 +127,7 @@ func runBump(opts *AWSOpts) error {
 		}
 		if opts.FunctionName != "" {
 			rt, _ := getRuntime(cli, opts.FunctionName)
-			printRow(tw, opts.Profile, region, opts.FunctionName, rt)
+			printRow(tw, acctID, opts.Profile, region, opts.FunctionName, rt, opts.ShowProfile)
 			if rt == opts.SourceRuntime {
 				updateAndWait(cli, opts.FunctionName, opts.TargetRuntime, opts.Timeout, opts.PollEvery)
 			}
@@ -119,7 +136,7 @@ func runBump(opts *AWSOpts) error {
 			for _, f := range funcs {
 				fn := aws.ToString(f.FunctionName)
 				rt := string(f.Runtime)
-				printRow(tw, opts.Profile, region, fn, rt)
+				printRow(tw, acctID, opts.Profile, region, fn, rt, opts.ShowProfile)
 				if rt == opts.SourceRuntime {
 					updateAndWait(cli, fn, opts.TargetRuntime, opts.Timeout, opts.PollEvery)
 				}
@@ -150,6 +167,31 @@ func lambdaClient(region, profile string) (*lambda.Client, error) {
 		return nil, err
 	}
 	return lambda.NewFromConfig(cfg), nil
+}
+
+func stsClient(profile string) (*sts.Client, error) {
+	ctx := context.Background()
+	// Region-agnostic; STS is global but SDK requires a region—use us-east-1 safely.
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion("us-east-1"),
+		config.WithSharedConfigProfile(profile),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return sts.NewFromConfig(cfg), nil
+}
+
+func resolveAccountID(profile string) (string, error) {
+	cli, err := stsClient(profile)
+	if err != nil {
+		return "", err
+	}
+	out, err := cli.GetCallerIdentity(context.Background(), &sts.GetCallerIdentityInput{})
+	if err != nil {
+		return "", err
+	}
+	return aws.ToString(out.Account), nil
 }
 
 func listAllFunctions(cli *lambda.Client) ([]lamtypes.FunctionConfiguration, error) {
@@ -213,14 +255,24 @@ func updateAndWait(cli *lambda.Client, fn, target string, timeout, poll time.Dur
 	}
 }
 
-func printHeader(w *tabwriter.Writer) {
-	fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", "Profile", "Region", "FunctionName", "CurrentRuntime")
-	fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", "-------", "------", "------------", "--------------")
+// output: AccountID-first; profile optional
+func printHeader(w *tabwriter.Writer, showProfile bool) {
+	if showProfile {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", "AccountID", "Profile", "Region", "FunctionName", "CurrentRuntime")
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", "---------", "-------", "------", "------------", "--------------")
+	} else {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", "AccountID", "Region", "FunctionName", "CurrentRuntime")
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", "---------", "------", "------------", "--------------")
+	}
 }
 
-func printRow(w *tabwriter.Writer, profile, region, fn, rt string) {
+func printRow(w *tabwriter.Writer, accountID, profile, region, fn, rt string, showProfile bool) {
 	if rt == "" {
 		rt = "N/A"
 	}
-	fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", profile, region, fn, rt)
+	if showProfile {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", accountID, profile, region, fn, rt)
+	} else {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", accountID, region, fn, rt)
+	}
 }
